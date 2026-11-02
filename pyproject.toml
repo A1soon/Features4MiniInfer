@@ -29,6 +29,7 @@ addopts = ["--import-mode=importlib"]
 pythonpath = "."
 
 [tool.setuptools.packages.find]
-where = ["miniinfer"]
+where = ["."]
+include = ["miniinfer*", "kernels", "kernels.triton*"]
 #[tool.uv.extra-build-dependencies]
 #flash-attn = ["torch"]

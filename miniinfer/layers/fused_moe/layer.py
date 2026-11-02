@@ -27,7 +27,14 @@ from miniinfer.layers.fused_moe.dispatcher import (
 )
 from miniinfer.layers.fused_moe.experts import FusedExperts
 
+# FusedExperts完成了expert中MLP的fused实现
+# FusedMoE定义了MoE需要的参数
+# FusedExperts 是“算子/计算层面的融合”，而 FusedMoE 是“宏观系统流水线（Pipeline）层面的融合”。
 
+# 在早期的 MoE 实现中（比如你最开始看的那种参考代码，或者早期的 Megatron/DeepSpeed），这些步骤是完全分离的。
+# 你要自己写 Router 代码，自己写跨卡通信发 Token（Dispatch），自己建几十个专家的 nn.Linear 去算，最后再自己写 All-to-All 收回来并加权求和（Combine）。
+
+# FusedMoE 把这一整条极其复杂的分布式长链路，全部“缝合”进了一个单一的 forward 函数里。
 class FusedMoE(nn.Module):
     def __init__(
         self,
@@ -47,6 +54,13 @@ class FusedMoE(nn.Module):
         self.intermediate_size = intermediate_size
         self.norm_topk_prob = norm_topk_prob
         self.parallel = parallel or MoEParallelConfig()
+        self.parallel.expert_range(num_experts)
+        if not 1 <= top_k <= num_experts:
+            raise ValueError("top_k must be in [1, num_experts]")
+        if hidden_size <= 0 or intermediate_size <= 0:
+            raise ValueError("hidden_size and intermediate_size must be positive")
+        if intermediate_size % self.parallel.tp_size:
+            raise ValueError("intermediate_size must be divisible by tp_size")
 
         # router gate 是 replicated（vLLM 约定）且不量化。
         self.gate = nn.Linear(hidden_size, num_experts, bias=False, dtype=dtype, device=device)
@@ -138,6 +152,12 @@ class FusedMoE(nn.Module):
         local_id = expert_id - self.experts.local_expert_start
         I_local = self.experts.intermediate_size_local
         tp_rank = self.parallel.tp_rank
+        expected_shape = (
+            (self.hidden_size, self.intermediate_size) if which == "down_proj"
+            else (self.intermediate_size, self.hidden_size)
+        )
+        if tuple(weight.shape) != expected_shape:
+            raise ValueError(f"Wrong {which} shape: {tuple(weight.shape)} != {expected_shape}")
         if which == "gate_proj":
             shard = weight.narrow(0, tp_rank * I_local, I_local)
             self.experts.w13_weight.data[local_id, :I_local].copy_(shard)

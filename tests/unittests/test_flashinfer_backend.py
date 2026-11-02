@@ -10,6 +10,11 @@ def mock_kv_cache_mgr():
   mgr = MagicMock()
   mgr.page_size = 16
   mgr.device = "cuda" if torch.cuda.is_available() else "cpu"
+  # get_page_table returns token slots: row 0 uses pages 0/1, row 1 uses 2/3.
+  # Only the first 20 positions are needed for this batch's maximum length.
+  mgr.get_page_table.return_value = torch.arange(
+    64, device=mgr.device, dtype=torch.int64
+  ).reshape(2, 32)[:, :20]
   return mgr
 
 
@@ -31,13 +36,6 @@ def mock_forward_batch():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="FlashInfer requires CUDA")
 def test_flashinfer_init_metadata_extend(mock_kv_cache_mgr, mock_forward_batch):
-  # Setup mock page table
-  # page_size=16. seq_len=10 -> 1 page. seq_len=20 -> 2 pages.
-  # Max pages = 2.
-  mock_kv_cache_mgr.get_page_table.return_value = (
-    torch.arange(4, device="cuda").reshape(2, 2).int()
-  )  # [batch, max_pages]
-
   backend = FlashInferBackend(mock_kv_cache_mgr)
 
   backend.init_forward_metadata(mock_forward_batch)
@@ -56,12 +54,7 @@ def test_flashinfer_init_metadata_extend(mock_kv_cache_mgr, mock_forward_batch):
   expected_last_len = torch.tensor([10, 4], device="cuda", dtype=torch.int32)
   torch.testing.assert_close(metadata.paged_kv_last_page_len, expected_last_len)
 
-  # Check paged_kv_indices
-  # indices should be [0, 2, 3] (from raw table [[0, 1], [2, 3]])
-  # Wait, raw table is:
-  # req 0: pages [0, 1]. valid pages = 1. -> [0]
-  # req 1: pages [2, 3]. valid pages = 2. -> [2, 3]
-  # Result: [0, 2, 3]
+  # Slots at offsets 0/16 identify each page. Length 10 excludes row 0's page 1.
   expected_indices = torch.tensor([0, 2, 3], device="cuda", dtype=torch.int32)
   torch.testing.assert_close(metadata.paged_kv_indices, expected_indices)
 
@@ -75,9 +68,6 @@ def test_flashinfer_init_metadata_extend(mock_kv_cache_mgr, mock_forward_batch):
 def test_flashinfer_init_metadata_decode(mock_kv_cache_mgr, mock_forward_batch):
   mock_forward_batch.forward_mode = ForwardMode.DECODE
 
-  # page_size=16. seq_len=10 -> 1 page. seq_len=20 -> 2 pages.
-  mock_kv_cache_mgr.get_page_table.return_value = torch.arange(4, device="cuda").reshape(2, 2).int()
-
   backend = FlashInferBackend(mock_kv_cache_mgr)
   backend.init_forward_metadata(mock_forward_batch)
 
@@ -90,3 +80,7 @@ def test_flashinfer_init_metadata_decode(mock_kv_cache_mgr, mock_forward_batch):
   # paged_kv.. should be same
   expected_indptr = torch.tensor([0, 1, 3], device="cuda", dtype=torch.int32)
   torch.testing.assert_close(metadata.paged_kv_indptr, expected_indptr)
+  expected_indices = torch.tensor([0, 2, 3], device="cuda", dtype=torch.int32)
+  torch.testing.assert_close(metadata.paged_kv_indices, expected_indices)
+  expected_last_len = torch.tensor([10, 4], device="cuda", dtype=torch.int32)
+  torch.testing.assert_close(metadata.paged_kv_last_page_len, expected_last_len)

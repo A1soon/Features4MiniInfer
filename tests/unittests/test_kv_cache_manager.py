@@ -11,15 +11,15 @@ KV Cache Manager 单元测试
 
 import pytest
 import torch
-from engine.scheduler_batch import Req, ScheduledBatch
-from kvcache.memory_pool import (
+from miniinfer.scheduler.scheduler_batch import Req, ScheduledBatch
+from miniinfer.kvcache.memory_pool import (
   TokenAllocator,
   RequestPool,
   MHAKVCacheStorage,
   PagedTokenAllocator,
 )
-from kvcache.radix_cache import RadixCache
-from kvcache.kv_cache_manager import KVCacheManager
+from miniinfer.kvcache.radix_cache import RadixCache
+from miniinfer.kvcache.kv_cache_manager import KVCacheManager
 
 
 # ============== 测试配置 ==============
@@ -205,21 +205,21 @@ class TestRadixCache:
   def test_basic_insert_match(self):
     """基本插入和匹配"""
     allocator = TokenAllocator(size=1000, device=DEVICE)
-    cache = RadixCache(token_allocator=allocator, page_size=1)
+    cache = RadixCache(token_allocator=allocator, page_size=2)
 
     # 插入一个序列
     key = [1, 2, 3, 4, 5]
     value = torch.tensor([10, 20, 30, 40, 50], dtype=torch.int64, device=DEVICE)
     cache.insert(key, value)
 
-    # 完全匹配
+    # page_size=2 时 RadixCache 只保存完整 page，末尾的单个 token 不会缓存。
     matched_value, node = cache.match_prefix(key)
-    assert len(matched_value) == 5
+    assert len(matched_value) == 4
 
     # 前缀匹配
     longer_key = [1, 2, 3, 4, 5, 6, 7]
     matched_value, node = cache.match_prefix(longer_key)
-    assert len(matched_value) == 5  # 只匹配前 5 个
+    assert len(matched_value) == 4  # 只匹配已缓存的两个完整 page
 
   def test_no_match(self):
     """无匹配"""
@@ -247,6 +247,49 @@ class TestRadixCache:
     # 部分匹配
     matched_value, node = cache.match_prefix([1, 2, 5, 6])
     assert len(matched_value) == 2  # 只有 [1, 2] 匹配
+
+  def test_waiting_prefix_retry_balances_radix_locks(self):
+    """Waiting retries keep one lock per request, including when the hit grows."""
+    allocator = TokenAllocator(size=64, device="cpu")
+    cache = RadixCache(token_allocator=allocator, page_size=2)
+    cache.insert([1, 2], torch.tensor([20, 21], dtype=torch.int64))
+
+    manager = KVCacheManager.__new__(KVCacheManager)
+    manager.prefix_cache = cache
+    manager.device = torch.device("cpu")
+
+    req_a = Req([1, 2, 3, 4, 5])
+    req_b = Req([1, 2, 8, 9])
+    manager.prefix_for_waiting_req(req_a)
+    manager.prefix_for_waiting_req(req_b)
+
+    shared_node = req_a.last_node
+    assert shared_node is req_b.last_node
+    assert shared_node.lock_ref == 2
+    assert cache.protected_size() == 2
+
+    # A NO_TOKEN/OTHER retry can look up the same waiting request again.
+    manager.prefix_for_waiting_req(req_a)
+    assert shared_node.lock_ref == 2
+    assert cache.protected_size() == 2
+
+    # Another request extends the cached path while both requests are waiting.
+    cache.insert([1, 2, 3, 4], torch.tensor([20, 21, 22, 23], dtype=torch.int64))
+    manager.prefix_for_waiting_req(req_a)
+    extended_node = req_a.last_node
+    assert extended_node is not shared_node
+    assert extended_node.lock_ref == 1
+    assert shared_node.lock_ref == 2
+    assert cache.protected_size() == 4
+
+    # Each request releases only its own path reference.
+    cache.dec_lock_ref(extended_node)
+    assert extended_node.lock_ref == 0
+    assert shared_node.lock_ref == 1
+    assert cache.protected_size() == 2
+    cache.dec_lock_ref(req_b.last_node)
+    assert shared_node.lock_ref == 0
+    assert cache.protected_size() == 0
 
 
 # ============== KVCacheManager 集成测试 ==============
@@ -528,28 +571,33 @@ class TestPagedKVCacheManager:
     manager.prepare_for_extend(batch_base)
     req_base.req_pool_idx = int(batch_base.req_pool_indices[0].item())
     req_base.req_id = req_base.req_pool_idx
+    # 该低层测试不执行模型 forward；显式模拟 prompt KV 已完成写入。
+    req_base.mark_kv_committed(len(req_base.origin_input_ids))
     manager.release_request(req_base, is_insert=True)
 
-    # one page occupied by radix cache, two pages free
-    assert manager.available_tokens() == PAGE_SIZE * 2
+    # 物理上两页空闲；另有一页在 RadixCache 中，可驱逐后重用。
+    assert manager.token_allocator.available_size() == PAGE_SIZE * 2
+    assert manager.available_tokens() == PAGE_SIZE * 3
 
     # second request reuses the cached page and extends by 16 tokens
     req_hit = Req(list(range(PAGE_SIZE)) + list(range(1000, 1016)))
     manager.prefix_for_waiting_req(req_hit)
     assert req_hit.cache_protected_len == PAGE_SIZE
 
-    # lock the matched radix node to make protected_size non-zero
-    manager.prefix_cache.inc_lock_ref(req_hit.last_node)
+    # prefix_for_waiting_req 已为该请求加锁，不需要手动增加第二个引用。
     assert manager.prefix_cache.protected_size() == PAGE_SIZE
 
     batch_hit = ScheduledBatch.init_new([req_hit], device=torch.device(DEVICE))
     manager.prepare_for_extend(batch_hit)
     req_hit.req_pool_idx = int(batch_hit.req_pool_indices[0].item())
     req_hit.req_id = req_hit.req_pool_idx
+    # 模拟 extend forward 完成，使 16 个新 token 的 KV 进入释放边界。
+    req_hit.mark_kv_committed(len(req_hit.fill_ids))
 
     manager.release_request(req_hit, is_insert=True)
 
-    # radix cache keeps two pages cached, leaving exactly one free page
-    assert manager.available_tokens() == PAGE_SIZE
+    # 16-token 尾部不足一页，释放时整页归还；缓存页仍在，但已不受保护。
+    assert manager.token_allocator.available_size() == PAGE_SIZE * 2
+    assert manager.available_tokens() == PAGE_SIZE * 3
     assert manager.prefix_cache.protected_size() == 0
     assert req_hit.last_node.lock_ref == 0

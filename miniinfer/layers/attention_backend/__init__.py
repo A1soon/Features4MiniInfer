@@ -10,10 +10,16 @@ __all__ = [
   "FlashAttention3Metadata",
   "FlashInferBackend",
   "FlashInferMetadata",
+  "FlashAttentionV100Backend",
+  "FlashAttentionV100Metadata",
 ]
 
 
 def __getattr__(name: str):
+  if name in {"FlashAttentionV100Backend", "FlashAttentionV100Metadata"}:
+    from .flashattention_v100_backend import FlashAttentionV100Backend, FlashAttentionV100Metadata
+
+    return locals()[name]
   if name in {
     "FlashAttention2Backend",
     "FlashAttention2Metadata",

@@ -9,7 +9,7 @@ Prefill 预算控制器
     4. cur_rem_tokens 跟踪当前 prefill 步骤即时可用 token
     5. 支持 chunked prefill: 超过单步预算的请求被自动截断为 chunk，
        chunked 请求必须被加入 can_run_list 以防内存泄漏
-    6. 所有预算以 page_size 粒度对齐
+    6. KV capacity/input 预算以 page_size 粒度对齐；compute budget 使用实际 token 数
     7. 预留足够 decode 空间，保证可调度超过最大显存的请求而不 OOM
 """
 
@@ -60,6 +60,7 @@ class PrefillAdder:
     chunk_size: Optional[int] = None,
     page_size: int = 256,
     min_decode_reserve_pages: int = 2,
+    compute_budget: Optional[int] = None,
   ):
     """
     Args:
@@ -71,6 +72,7 @@ class PrefillAdder:
         chunk_size:          分块大小；None 表示禁用 chunked prefill
         page_size:           KV cache 页对齐粒度
         min_decode_reserve_pages: 为 decode 预留的最小 page 数（软限制保护）
+        compute_budget: 本轮 prefill 可使用的独立计算预算；None 表示旧行为
     """
     self.max_batch_size = max_batch_size
     self.chunk_size = chunk_size
@@ -78,6 +80,9 @@ class PrefillAdder:
     self.new_token_ratio = new_token_ratio
     self.available_kv_tokens = available_kv_tokens
     self.min_decode_reserve = min_decode_reserve_pages * page_size
+    self.rem_compute_tokens = compute_budget
+    if self.rem_compute_tokens is not None and self.rem_compute_tokens < 0:
+      raise ValueError("compute_budget must be non-negative")
 
     # ========== 预算偏移 ==========
     # rem_total_token_offset: 累计预留量 (running 预留 + prefill 即时占用 + prefill 新 token 预留)
@@ -106,6 +111,7 @@ class PrefillAdder:
       f"running_reserve={self.rem_total_token_offset}, "
       f"rem_total={self.rem_total_tokens}, "
       f"rem_input={self.rem_input_tokens}, "
+      f"rem_compute={self.rem_compute_tokens}, "
       f"chunk_size={chunk_size}"
     )
 
@@ -150,7 +156,10 @@ class PrefillAdder:
   @property
   def available_prefill_budget(self) -> int:
     """当前可用的 prefill token 预算"""
-    return min(self.cur_rem_tokens, self.rem_input_tokens)
+    budgets = [self.cur_rem_tokens, self.rem_input_tokens]
+    if self.rem_compute_tokens is not None:
+      budgets.append(self.rem_compute_tokens)
+    return min(budgets)
 
   # ------------------------------------------------------------------ #
   #  预算状态检查
@@ -162,6 +171,9 @@ class PrefillAdder:
       return AddReqResult.NO_TOKEN
 
     if self.rem_input_tokens <= 0:
+      return AddReqResult.OTHER
+
+    if self.rem_compute_tokens is not None and self.rem_compute_tokens <= 0:
       return AddReqResult.OTHER
 
     if self.rem_chunk_tokens is not None and self.rem_chunk_tokens <= 0:
@@ -183,7 +195,7 @@ class PrefillAdder:
 
     Args:
         prefix_len:        prefix cache 命中长度（仅用于统计）
-        extend_input_len:  对齐后的 extend 输入 token 数
+        extend_input_len:  实际的 extend 输入 token 数；KV 记账时会向上对齐
         max_new_tokens:    该请求预估的最大新 token 数（完整 prefill 时传入，
                            chunked 中途传 0，因为该请求还没结束 prefill）
     """
@@ -193,6 +205,10 @@ class PrefillAdder:
     self.rem_total_token_offset += aligned + max_new_tokens
     # 即时占用 += 本次 extend 占用
     self.cur_rem_token_offset += aligned
+    # Compute accounting uses actual model input tokens. KV accounting above
+    # intentionally remains page-aligned because the allocator works in pages.
+    if self.rem_compute_tokens is not None:
+      self.rem_compute_tokens -= max(int(extend_input_len), 0)
     # 扣减 input / chunk 额度
     self.rem_input_tokens -= aligned
     if self.rem_chunk_tokens is not None:
@@ -263,6 +279,12 @@ class PrefillAdder:
     """
     尝试添加一个新的 prefill 请求。
 
+    这个函数不分配 KV cache，也不跑模型；它只是回答一个问题：
+    “当前这轮 schedule 的预算，还能不能把这个 Req 放进 prefill batch？”
+
+    req.extend_input_len 已经由 KVCacheManager.prefix_for_waiting_req() 算好。
+    它表示扣掉 prefix cache 命中后，本轮还需要真实 forward 的 token 数。
+
     检查顺序:
     1. batch size 上限
     2. 总 token 预算 (extend + decode 预留 ≤ rem_total_tokens)
@@ -275,27 +297,47 @@ class PrefillAdder:
     Returns:
         AddReqResult 指示当前预算状态
     """
-    # batch size 检查
+    # batch size 检查。
+    # 一个 batch 里能放多少个 sequence，受 request pool 和模型 batch 上限约束。
     if self.total_reqs >= self.max_batch_size:
       return AddReqResult.OTHER
 
     extend_len = getattr(req, "extend_input_len", 0)
     if extend_len <= 0:
+      # 完全命中 prefix cache 时，理论上没有新增 prompt token 需要 prefill。
+      # 这里直接返回 CONTINUE，表示这个请求本身没有额外消耗。
       return AddReqResult.CONTINUE
 
     max_tokens = getattr(req, "max_tokens", 0)
     output_len = len(getattr(req, "output_ids", []))
-    # 该请求整体需要的 token: extend 输入 + 未来 decode 输出预留
+    # 该请求整体需要的 token = 本轮 prompt extend + 未来 decode 输出预留。
+    #
+    # 为什么 prefill 阶段要预留 decode？
+    # 因为请求一旦完成 prefill，就会进入 running_batch，每轮 decode 都继续占 KV cache。
+    # 如果 prefill 时完全不预留，系统可能把显存都塞给 prompt，后面 decode 时立刻 OOM。
     decode_reserve = min(max(max_tokens - output_len, 0), CLIP_MAX_NEW_TOKENS)
-    total_tokens = extend_len + decode_reserve
-
+    # KV allocator 以 page 为粒度，真实消耗要向上对齐。Compute budget
+    # below intentionally uses the unaligned ``extend_len`` instead.
     input_tokens = self.ceil_paged_tokens(extend_len)
+    total_tokens = input_tokens + decode_reserve
+
+    # Aggregate policy adds an independent compute constraint. ``rem_total``
+    # protects KV capacity; this value protects the amount of work in one
+    # iteration so decode latency remains bounded.
+    compute_limited = (
+      self.rem_compute_tokens is not None and extend_len > self.rem_compute_tokens
+    )
+    if compute_limited and self.rem_chunk_tokens is None:
+      # Without chunking there is no legal way to split this request while
+      # preserving P_t <= budget. The aggregate policy enables chunking in the
+      # EngineConfig, but keep this guard for direct PrefillAdder callers.
+      return AddReqResult.NO_TOKEN if not self.can_run_list else AddReqResult.OTHER
 
     # --- 总 token 预算检查 ---
     # 修改: 当启用 chunked prefill 时，不直接返回 NO_TOKEN，
     # 而是尝试分块处理请求
     # 注意: 使用 > 而非 >=，允许 total_tokens == rem_total_tokens 的边界情况通过
-    if total_tokens > self.rem_total_tokens:
+    if total_tokens > self.rem_total_tokens or compute_limited:
       # 如果 chunked prefill 未启用，直接拒绝
       if self.rem_chunk_tokens is None:
         return AddReqResult.NO_TOKEN
@@ -314,6 +356,8 @@ class PrefillAdder:
       # 必须使用 chunked 路径：只执行一部分 extend，不预留 decode 空间。
       # chunked 请求不预留 decode，只需要保留 1 个 token 的余量
       available_for_chunk = max(self.rem_total_tokens - 1, 0)
+      if self.rem_compute_tokens is not None:
+        available_for_chunk = min(available_for_chunk, self.rem_compute_tokens)
       available_for_chunk = (available_for_chunk // self.page_size) * self.page_size
 
       if available_for_chunk < min_chunk:
@@ -347,7 +391,9 @@ class PrefillAdder:
       return AddReqResult.CONTINUE
 
     # --- 输入 token 预算检查 (已有请求时不再加，留给下轮) ---
-    if input_tokens >= self.rem_input_tokens and len(self.can_run_list) > 0:
+    if input_tokens > self.rem_input_tokens and len(self.can_run_list) > 0:
+      # OTHER 不是“永远不能加”，只是“本轮先别加了”。
+      # 调用方会把这个 req 留在 waiting_queue，下一轮继续尝试。
       return AddReqResult.OTHER
 
     # --- 分 chunked / 非 chunked 路径 ---
@@ -356,7 +402,7 @@ class PrefillAdder:
       self.can_run_list.append(req)
       self._update_prefill_budget(
         0,
-        input_tokens,
+        extend_len,
         min(max_tokens, CLIP_MAX_NEW_TOKENS),
       )
     else:
@@ -389,10 +435,20 @@ class PrefillAdder:
     extend_len = getattr(req, "extend_input_len", 0)
 
     # 可用量 = min(chunk 预算, 总预算)
+    # 续 chunk 和新请求不同：它已经在前面 chunk 中分配过一部分 KV，
+    # 所以调度器会优先推进它，尽量避免长期占着半截状态。
     rem = self.rem_total_tokens
     if self.rem_chunk_tokens is not None:
       rem = min(rem, self.rem_chunk_tokens)
+    if self.rem_compute_tokens is not None:
+      rem = min(rem, self.rem_compute_tokens)
     _rem_tokens = int(rem)
+
+    if _rem_tokens <= 0 and self.rem_compute_tokens is not None:
+      # Do not fall back to a page here: that would violate P_t + D_t <= B.
+      # The scheduler will keep this unfinished chunk for the next iteration.
+      req.extend_input_len = 0
+      return req
 
     # 即使预算 ≤ 0 也必须加入列表，退而使用 chunk 预算兜底
     if _rem_tokens <= 0:
@@ -404,6 +460,12 @@ class PrefillAdder:
 
     truncated = extend_len > _rem_tokens
     req.extend_input_len = min(extend_len, _rem_tokens)
+    if truncated:
+      # Intermediate chunks must end on a page boundary so RadixCache can
+      # preserve their entire KV prefix when the temporary request row is freed.
+      req.extend_input_len = (req.extend_input_len // self.page_size) * self.page_size
+      if req.extend_input_len == 0:
+        return req
     prefix_len = len(getattr(req, "prefix_indices", []))
     req.fill_ids = req.fill_ids[: prefix_len + req.extend_input_len]
 

@@ -9,6 +9,8 @@ __all__ = [
   "FlashAttention2Metadata",
   "FlashAttention3Backend",
   "FlashAttention3Metadata",
+  "FlashAttentionV100Backend",
+  "FlashAttentionV100Metadata",
   "VocabEmbedding",
   "LMHead",
   "linear",
@@ -21,6 +23,10 @@ __all__ = [
 
 
 def __getattr__(name: str):
+  if name in {"FlashAttentionV100Backend", "FlashAttentionV100Metadata"}:
+    from .attention_backend import FlashAttentionV100Backend, FlashAttentionV100Metadata
+
+    return locals()[name]
   if name in {"apply_activation", "get_activation"}:
     from .activation import apply_activation, get_activation
 

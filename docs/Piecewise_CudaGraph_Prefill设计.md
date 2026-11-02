@@ -1,54 +1,57 @@
-# Piecewise CUDA Graph for Prefill（MoE-extensible）
+# V100 Prefill/Mixed Static-Bucket CUDA Graph
 
-对应提交：piecewise cuda graph 框架（`miniinfer/engine/piecewise_cuda_graph.py` + FA2 extend cuda-graph metadata）。
+状态：真实 Qwen3-30B EP4 上已完成 256/512 bucket capture/replay、same-padding eager logits
+parity、top-1 对照和 prefill/decode/chunked-mixed/shared-prefix smoke，四 rank 正常 teardown。
+与 unpadded eager 的逐元素 strict parity（`rtol=atol=1e-3`）仍未通过，Graph 默认关闭；没有
+性能或服务模式结果。详细原始记录见实验目录 `logs/prefill-graph-20261029/README.zh-CN.md`。
 
-## 背景
+10-29 最新 run 的 Graph 对同 padding eager 最大绝对误差为 `0.0`，所有已测 top-1 相同；
+padded 与 unpadded eager 的最大观测误差为 `1.359375`。FP16 reduce 长度敏感性探针显示
+shape-dependent rounding，但真实模型 FP32 reduce 对照仍有差异，因此尚不能把它认定为唯一
+根因。最终诊断 run 的 smoke `status=PASS` 不表示 unpadded strict logits parity 通过。
 
-prefill 走 varlen attention，`total_tokens` 随 batch 变化，无法像 decode 那样按 power-of-2 batch size 直接单图捕获。vLLM 的 cuDAG 用 **piecewise**：把 forward 拆成 segment，**静态形状的（GEMM/norm/embedding）用 cuda graph 捕获**，**动态形状的（varlen attention、MoE router/grouped-GEMM）eager**，二者通过预分配 buffer 串联。
+## 实现边界
 
-## 设计（可扩展，MoE-ready）
+当前 runner 捕获整段模型 forward，不是把 attention、MoE 切成各自独立的 graph/eager
+segments。仅用于 `flash_attn_v100`，通过 `MINIINFER_PREFILL_CG=1` 显式开启；默认 eager。
+EP 每个 rank 同步捕获，并在初始化后核对各 rank 的 decode/prefill bucket 签名。
 
-### Segment 注册机制
-```python
-@dataclass
-class Segment:
-    name: str
-    eager: bool          # True=动态形状每步 eager（varlen attn / MoE router）；False=按 bucket 捕获
-    run: Callable[[ReplayContext], None]
-```
-`PiecewiseCudaGraphRunner.register_segment(Segment(...))` 按顺序注册，capture/replay 按顺序串联。MoE 接入时把 router+grouped-GEMM 注册为 eager segment，前后的 dense GEMM 仍 captured——**无需改 runner**。
+- 最多两个真实请求，默认 token buckets 为 256 和 512；由
+  `MINIINFER_PREFILL_CG_MAX_SEQS` 与 `MINIINFER_PREFILL_CG_MAX_TOKENS` 限制。
+- 每个 bucket 使用固定的两个真实请求槽和一个 padding 槽。按 query lengths 构造
+  `cu_seqlens_q` 与 last-token indices，输出只包含各请求最后 token 的 logits。
+- 请求数或 query layout 不能安全填充、超过 bucket、sequence/page table 超容量时返回
+  eager fallback。Prefix 命中和 mixed metadata 都根据当前真实 page table/长度更新，不使用
+  capture 时冻结的请求状态。
+- `page 0` 保持 KV allocator 的 dummy/padding 页；长 padding 行使用从 allocator 单独保留的
+  scratch pages，避免写入真实请求的 live KV slots。
+- 可设置 `MINIINFER_PREFILL_CG_VERIFY=1`，在 graph replay 前将同一 ForwardBatch eager logits
+  快照到 CPU，再对比 graph 结果。CPU snapshot 可避免 graph 后续执行期间 CUDA allocator
+  复用 eager 输出的底层 GPU storage。
 
-### v1 dense（本提交）
-- 按 token bucket（powers of 2 ≤ `max_extend_len`：1024/2048/4096/8192）捕获整层 forward。
-- **dummy padding seq** 把 `total_tokens` 补到 bucket：dummy token 的 `out_cache_loc` 指向保留的 page 0（KV 写入 page 0，覆盖无害）；varlen attention 处理 `[actual + dummy] = [bucket]`，输出 `[bucket]`，末尾取 `[:actual]`。
-- 静态 buffer（per bucket）：`input_ids/positions/out_cache_loc [bucket]`、`cu_seqlens_q/k [max_nseq+2]` 等，replay 前 in-place 更新。
-- FA2 后端新增 `init_extend_cuda_graph_metadata` / `update_extend_cuda_graph_metadata`（per-bucket 静态 cu_seqlens，避免后捕获覆盖前者——与 decode 的同类 bug 同理）。
+## 测试与风险
 
-### MoE 扩展点（后续）
-dense 的「整层 forward」segment 拆成：
-- `pre_attn`（captured）：input_norm + qkv + qk_norm + rope。
-- `attn`（eager）：varlen attention，写 o 进 `[bucket]` buffer。
-- `post_attn`（captured）：o_proj + residual + post_norm + **dense MLP（captured）** 或 **MoE（eager: router + grouped-GEMM）**。
+`tests/unittests/test_cuda_graph_plan.py` 覆盖 bucket、固定行数的 padding layout 以及 V100
+extend metadata tensor 引用。对应 EP/Graph CPU 回归通过；新增动态 query/KV attention Graph
+探针也已在 V100 通过。10-28 首轮非法访存及 10-29 workspace 生命周期修复的全过程保留在
+`logs/prefill-graph-20261028/` 与 `logs/prefill-graph-20261029/`。
 
-只需注册对应 segment，runner 按序串联。
+10-29 的真实 smoke 覆盖 300-token prefill、7-token decode、2 个 mixed steps 和 256-token
+shared-prefix hit。Graph 与同 padding eager 的 logits exact match；与 unpadded eager 的 top-1
+一致，但 logits strict parity 不满足原容差。`1046-reduce-padding` 的 FP16 shape probe 显示
+max abs 差 `0.0078125`，而真实模型尝试 FP32 EP reduce 仍未闭合差异。结果提示数值路径依赖
+shape/reduction，但唯一来源尚未隔离。没有放宽容差，也没有以 top-1 替代 strict logits parity。
 
-## 当前状态
+本轮没有性能测试、更大 decode bucket 或服务模式覆盖。保持功能默认关闭。若目标要求 unpadded
+逐元素 parity，后续应统一 eager 与 graph 的 collective shape/运算路径后再做 GPU 对照；不能
+只将 padded eager 设为参考来声称 strict parity。
 
-框架已就位，但 **v1 capture 默认关闭**（`MINIINFER_PREFILL_CG=1` 开启尝试，失败自动回落 eager prefill，无回归）。
+捕获图内仍包含 V100 varlen paged attention、MoE Triton 路由/grouped GEMM 及 EP all-reduce。
+Capture/replay 期间各 rank 必须保持相同 bucket、query layout 和 collective 顺序。
+任何 capture 失败在 EP 下都应让初始化失败并清理 worker，不允许某些 rank 静默 eager、其它
+rank replay graph。单进程模式可跳过失败 bucket，后续 eager fallback。
 
-### 待修（v1 capture 未跑通）
-1. **capture-unsafe op**：capture 时报 `cudaErrorStreamCaptureInvalidated`。疑似 prefill forward 内有 capture 不安全的操作（如 `Qwen3ForCausalLM.forward` 的 last-token 索引 `torch.tensor(last_token_indices, device=...)` 的 H2D，或某个隐式 sync）。需用 `CUDA_LAUNCH_BLOCKING=1` 定位。
-2. **last-token 索引与 graph 切片不匹配**：`Qwen3ForCausalLM.forward`（extend）对 logits 做 last-token 索引（输出 `[nseq]`），但 piecewise graph 需要 `[bucket]` 全量 logits 再 `[:actual]` 切片。需为 capture 提供一个「全量 logits」forward 路径（或 graph 内不索引、graph 外切片）。
-
-### 已验证
-- 框架导入、segment 注册、capture/replay 结构、FA2 extend metadata 方法均就位。
-- 默认关闭时引擎正常（eager prefill，greedy 与 HF 一致，无回归）。
-- 命中 prefix cache 或超 bucket 时自动回落 eager（`replay` 返回 `None`）。
-
-## 文件
-- `miniinfer/engine/piecewise_cuda_graph.py`：`Segment` / `ReplayContext` / `PiecewiseCudaGraphRunner`。
-- `miniinfer/layers/attention_backend/flashattention_backend.py`：FA2 `init_extend_cuda_graph_metadata` / `update_extend_cuda_graph_metadata`。
-- `miniinfer/engine/model_runner.py`：`forward_extend` 优先用 piecewise graph（`MINIINFER_PREFILL_CG=1` 时），`init_cuda_graph` 末尾初始化 runner。
-
-## 性能预期
-prefill 的 gap（MiniInfer 88k vs vLLM 134k in_tok/s）主因是 GEMM-bound + eager launch 开销。piecewise cuda graph 消除 launch 开销（profile 显示 `cudaLaunchKernel` 8572 次/prefill），预计 prefill 提速 ~1.2×（GEMM 本身的 cuBLAS 效率差距仍需单独优化）。闭合 v1 capture 后可验证。
+MoE 的 `_workspace` 是 capture pool 以外的外部 tensor；CUDA Graph 不自动延长其生命周期。
+decode `CapturedGraph.moe_workspaces` 和 prefill buffers 必须保留这些对象，即使后来 warmup
+更大 bucket 或 eager fallback 触发扩容。销毁前显式 reset 图句柄，避免异常栈持有 graph
+对象时 NCCL teardown 等待；61 项 CPU 回归及四 rank 多 bucket 扩容探针已通过。

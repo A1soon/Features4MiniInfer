@@ -1,4 +1,4 @@
-"""MiniInfer package entrypoint with eager subpackage imports."""
+"""Public exports, resolved on demand so CPU tools do not import CUDA kernels."""
 
 from __future__ import annotations
 
@@ -6,91 +6,46 @@ import importlib
 import os
 from typing import Iterable
 
-from .config import EngineConfig, PretrainedConfig, Qwen2Config, Qwen3Config
-from .engine import (
-  CapturedGraph,
-  ChatTemplateHandler,
-  CudaGraphRunner,
-  DecodeState,
-  FutureIndices,
-  FutureMap,
-  IncrementalBatchTokenizer,
-  IncrementalDecoder,
-  LLMEngine,
-  ModelRunner,
-  OverlapBatchRecord,
-  OverlapExecutor,
-  RequestOutput,
-  StepOutput,
-)
-from .kvcache import (
-  IKVCacheStorage,
-  IPrefixCache,
-  IRequestPool,
-  ITokenAllocator,
-  KVCacheManager,
-  MHAKVCacheStorage,
-  PagedTokenAllocator,
-  RadixCache,
-  RequestPool,
-  TokenAllocator,
-)
-from .layers import (
-  AttentionBackend,
-  AttentionImpl,
-  FlashAttention2Backend,
-  FlashAttention2Metadata,
-  FlashAttention3Backend,
-  FlashAttention3Metadata,
-  LMHead,
-  RMSNorm,
-  RotaryEmbedding,
-  Sampler,
-  VocabEmbedding,
-  apply_activation,
-  causal_mask,
-  get_activation,
-  get_attention,
-  linear,
-  softmax,
-)
-from .loader import DisabledTqdm, WeightLoaderMixin, load_hf_weight
-from .models import (
-  BaseModelOutput,
-  Qwen2Attention,
-  Qwen2ForCausalLM,
-  Qwen2MLP,
-  Qwen2Model,
-  Qwen2TransformerBlock,
-  Qwen3Attention,
-  Qwen3ForCausalLM,
-  Qwen3MLP,
-  Qwen3Model,
-  Qwen3TransformerBlock,
-)
-from .scheduler import (
-  AddReqResult,
-  BatchResult,
-  BatchType,
-  ChunkedReq,
-  ForwardBatch,
-  ForwardMode,
-  PrefillAdder,
-  Req,
-  ScheduledBatch,
-  Scheduler,
-  clamp_position,
-  compute_positions_extend,
-)
-from .utils import (
-  SamplingParams,
-  calc_max_total_tokens,
-  dequantize_linear,
-  make_model,
-  profile_methods,
-  shortcut_name_to_full_name,
-  stage,
-)
+_EXPORT_GROUPS = {
+  "config": "EngineConfig PretrainedConfig Qwen2Config Qwen3Config",
+  "engine": (
+    "CapturedGraph ChatTemplateHandler CudaGraphRunner DecodeState FutureIndices FutureMap "
+    "IncrementalBatchTokenizer IncrementalDecoder LLMEngine ModelRunner OverlapBatchRecord "
+    "OverlapExecutor RequestOutput StepOutput"
+  ),
+  "kvcache": (
+    "IKVCacheStorage IPrefixCache IRequestPool ITokenAllocator KVCacheManager MHAKVCacheStorage "
+    "PagedTokenAllocator RadixCache RequestPool TokenAllocator"
+  ),
+  "layers": (
+    "AttentionBackend AttentionImpl FlashAttention2Backend FlashAttention2Metadata "
+    "FlashAttention3Backend FlashAttention3Metadata FlashAttentionV100Backend "
+    "FlashAttentionV100Metadata LMHead RMSNorm RotaryEmbedding Sampler VocabEmbedding "
+    "apply_activation causal_mask get_activation get_attention linear softmax"
+  ),
+  "loader": "DisabledTqdm WeightLoaderMixin load_hf_weight",
+  "models": (
+    "BaseModelOutput Qwen2Attention Qwen2ForCausalLM Qwen2MLP Qwen2Model Qwen2TransformerBlock "
+    "Qwen3Attention Qwen3ForCausalLM Qwen3MLP Qwen3Model Qwen3TransformerBlock"
+  ),
+  "scheduler": (
+    "AddReqResult BatchResult BatchType ChunkedReq ForwardBatch ForwardMode PrefillAdder Req "
+    "ScheduledBatch Scheduler clamp_position compute_positions_extend"
+  ),
+  "utils": (
+    "SamplingParams calc_max_total_tokens dequantize_linear make_model profile_methods "
+    "shortcut_name_to_full_name stage"
+  ),
+}
+_EXPORT_MODULES = {name: module for module, names in _EXPORT_GROUPS.items() for name in names.split()}
+
+
+def __getattr__(name: str):
+  if name not in _EXPORT_MODULES:
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+  value = getattr(importlib.import_module(f"{__name__}.{_EXPORT_MODULES[name]}"), name)
+  globals()[name] = value
+  return value
 
 _EAGER_IMPORT_PACKAGES = (
   "config",
@@ -113,7 +68,7 @@ def eager_import_packages(packages: Iterable[str] = _EAGER_IMPORT_PACKAGES) -> N
     importlib.import_module(f"{__name__}.{package}")
 
 
-if os.getenv("MINIINFER_EAGER_IMPORT", "1").strip().lower() not in {"0", "false", "off", "no"}:
+if os.getenv("MINIINFER_EAGER_IMPORT", "0").strip().lower() not in {"0", "false", "off", "no"}:
   eager_import_packages()
 
 
@@ -135,6 +90,8 @@ __all__ = [
   "FlashAttention2Metadata",
   "FlashAttention3Backend",
   "FlashAttention3Metadata",
+  "FlashAttentionV100Backend",
+  "FlashAttentionV100Metadata",
   "ForwardBatch",
   "ForwardMode",
   "FutureIndices",

@@ -18,10 +18,9 @@ from __future__ import annotations
 from miniinfer.utils import get_logger
 import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List
 
 import torch
-import torch.nn as nn
 from miniinfer.utils.profiler_utils import profile_methods
 
 if TYPE_CHECKING:
@@ -35,6 +34,17 @@ if TYPE_CHECKING:
 
 
 logger = get_logger(__name__)
+
+
+def retain_moe_workspaces(model) -> tuple[torch.Tensor, ...]:
+  from miniinfer.layers.fused_moe.experts import FusedExperts
+
+  # Later prefill buckets or eager fallback can replace these external buffers.
+  # Graphs retain capture-pool allocations, not pre-existing module workspaces.
+  return tuple(
+    module._workspace for module in model.modules()
+    if isinstance(module, FusedExperts) and module._workspace is not None
+  )
 
 
 @dataclass
@@ -55,6 +65,7 @@ class CapturedGraph:
   seq_lens_int64: torch.Tensor = None  # [batch_size]
   # ForwardBatch used during graph capture (reused during replay)
   graph_batch: Any = None
+  moe_workspaces: tuple[torch.Tensor, ...] = ()
 
 
 @profile_methods("CudaGraphRunner")
@@ -108,6 +119,9 @@ class CudaGraphRunner:
 
     # Storage for captured graphs: {batch_size: CapturedGraph}
     self.graphs: Dict[int, CapturedGraph] = {}
+    # Reserve physical slots for padded rows. Reusing row 0's live slot here
+    # can overwrite a real request while the graph executes.
+    self.padding_cache_locs = self._reserve_padding_slots()
 
     # Generate list of batch sizes to capture (powers of 2)
     self.capture_batch_sizes = self._get_capture_batch_sizes()
@@ -120,14 +134,23 @@ class CudaGraphRunner:
 
   def _get_capture_batch_sizes(self) -> List[int]:
     """Get list of power-of-2 batch sizes to capture."""
+    return self.capture_batch_sizes(self.max_batch_size)
+
+  @staticmethod
+  def capture_batch_sizes(max_batch_size: int) -> List[int]:
+    """Return deterministic graph buckets without touching CUDA."""
+    if (
+      not isinstance(max_batch_size, int) or isinstance(max_batch_size, bool) or max_batch_size <= 0
+    ):
+      raise ValueError("max_batch_size must be a positive integer")
     sizes = []
     bs = 1
-    while bs <= self.max_batch_size:
+    while bs <= max_batch_size:
       sizes.append(bs)
       bs *= 2
     # Ensure max_batch_size is included if it's not a power of 2
-    if sizes[-1] < self.max_batch_size:
-      sizes.append(self.max_batch_size)
+    if sizes[-1] < max_batch_size:
+      sizes.append(max_batch_size)
     return sizes
 
   def _get_padded_batch_size(self, batch_size: int) -> int:
@@ -139,13 +162,43 @@ class CudaGraphRunner:
     if batch_size <= 0:
       return 1
     if batch_size > self.max_batch_size:
-      return self.max_batch_size
+      raise ValueError(
+        f"decode batch size {batch_size} exceeds CUDA Graph max_batch_size {self.max_batch_size}"
+      )
+
+    return self.padded_batch_size(self.max_batch_size, batch_size)
+
+  @staticmethod
+  def padded_batch_size(max_batch_size: int, batch_size: int) -> int:
+    """Return the graph bucket for a batch, without touching CUDA."""
+    if (
+      not isinstance(max_batch_size, int) or isinstance(max_batch_size, bool) or max_batch_size <= 0
+    ):
+      raise ValueError("max_batch_size must be a positive integer")
+    if batch_size <= 0:
+      return 1
+    if batch_size > max_batch_size:
+      raise ValueError("batch_size exceeds max_batch_size")
 
     # Find smallest power of 2 >= batch_size
     padded = 1
     while padded < batch_size:
       padded *= 2
-    return min(padded, self.max_batch_size)
+    return min(padded, max_batch_size)
+
+  def _reserve_padding_slots(self) -> torch.Tensor:
+    """Reserve scratch KV slots so graph padding never aliases a live request."""
+    allocator = getattr(self.kv_cache_mgr, "token_allocator", None)
+    free_pages = getattr(allocator, "free_pages", None)
+    if free_pages is None:
+      raise RuntimeError("CUDA Graph padding requires a paged KV allocator")
+    num_pages = math.ceil(self.max_batch_size / self.page_size)
+    if free_pages.numel() < num_pages:
+      raise RuntimeError("insufficient free KV pages for CUDA Graph padding slots")
+    pages = free_pages[:num_pages].clone()
+    allocator.free_pages = free_pages[num_pages:]
+    offsets = torch.arange(self.page_size, dtype=torch.int64, device=free_pages.device)
+    return (pages[:, None] * self.page_size + offsets).reshape(-1)[: self.max_batch_size]
 
   def _create_static_buffers(self, batch_size: int) -> CapturedGraph:
     """Create static placeholder buffers for a given batch size."""
@@ -187,8 +240,7 @@ class CudaGraphRunner:
     # cache_seqlens: minimum valid sequence length
     captured.cache_seqlens.fill_(2)  # at least 2 tokens
     # out_cache_loc: valid cache locations
-    for i in range(batch_size):
-      captured.out_cache_loc[i] = i
+    captured.out_cache_loc.copy_(self.padding_cache_locs[:batch_size])
     # req_pool_indices: valid indices
     for i in range(batch_size):
       captured.req_pool_indices[i] = i
@@ -235,6 +287,7 @@ class CudaGraphRunner:
       )
 
     torch.cuda.synchronize()
+    captured.moe_workspaces = retain_moe_workspaces(self.model)
 
     # Create the ForwardBatch BEFORE graph capture to avoid any Python operations during capture
     # The batch object itself is just a container and won't cause graph issues
@@ -304,6 +357,14 @@ class CudaGraphRunner:
     from miniinfer.models.base import BaseModelOutput
 
     actual_bs = forward_batch.batch_size
+    if not forward_batch.forward_mode.is_decode():
+      raise ValueError("CUDA Graph replay only supports decode batches")
+    if actual_bs <= 0:
+      raise ValueError("CUDA Graph replay requires a non-empty decode batch")
+    if actual_bs > self.max_batch_size:
+      raise ValueError(
+        f"decode batch size {actual_bs} exceeds CUDA Graph max_batch_size {self.max_batch_size}"
+      )
     padded_bs = self._get_padded_batch_size(actual_bs)
 
     if padded_bs not in self.graphs:
@@ -337,6 +398,8 @@ class CudaGraphRunner:
     actual_blocks = (actual_block_table[:, :: self.page_size].contiguous() // self.page_size).to(
       torch.int32
     )
+    if actual_blocks.shape[1] > self.max_blocks_per_seq:
+      raise ValueError("decode sequence exceeds captured CUDA Graph block-table capacity")
 
     # Copy actual data into static buffers
     captured.input_ids[:actual_bs].copy_(forward_batch.input_ids)
@@ -363,7 +426,9 @@ class CudaGraphRunner:
       captured.positions[actual_bs:padded_bs] = captured.positions[0]
       captured.cache_seqlens[actual_bs:padded_bs] = captured.cache_seqlens[0]
       captured.seq_lens_int64[actual_bs:padded_bs] = captured.seq_lens_int64[0]
-      captured.out_cache_loc[actual_bs:padded_bs] = captured.out_cache_loc[0]
+      captured.out_cache_loc[actual_bs:padded_bs].copy_(
+        self.padding_cache_locs[actual_bs:padded_bs]
+      )
       captured.req_pool_indices[actual_bs:padded_bs] = captured.req_pool_indices[0]
       captured.block_table[actual_bs:padded_bs] = captured.block_table[0]
 

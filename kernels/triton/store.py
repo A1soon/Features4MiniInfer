@@ -1,3 +1,5 @@
+"""Write per-token K/V tensors into their allocated physical KV slots."""
+
 import torch
 import triton
 import triton.language as tl
@@ -6,66 +8,107 @@ import triton.language as tl
 @triton.jit
 def store_kv_cache_kernel(
   k_ptr,
-  v_ptr,  # 输入的 K, V Tensor (当前 Step) [L, D]
+  v_ptr,
   k_cache_ptr,
-  v_cache_ptr,  # KV Cache 池 [Max_Blocks, D] 或类似扁平化结构
-  indices_ptr,  # 写入的目标位置索引 [L]
-  stride_k_l,
-  stride_k_d,  # K 输入的步长
-  stride_cache_x,
-  stride_cache_d,  # Cache 的步长
-  L,
-  D,  # 序列长度和 Head Dim
-  BLOCK_D: tl.constexpr,  # 维度分块大小 (通常设为 head_dim 的下一个 2 的幂)
+  v_cache_ptr,
+  indices_ptr,
+  stride_k_token,
+  stride_k_head,
+  stride_k_dim,
+  stride_v_token,
+  stride_v_head,
+  stride_v_dim,
+  stride_k_cache_slot,
+  stride_k_cache_head,
+  stride_k_cache_dim,
+  stride_v_cache_slot,
+  stride_v_cache_head,
+  stride_v_cache_dim,
+  num_tokens,
+  num_heads,
+  head_dim,
+  BLOCK_D: tl.constexpr,
 ):
-  # 每个 Program 处理序列 L 中的一个 token (对应 CUDA 中的一个 Warp)
   token_idx = tl.program_id(0)
+  head_idx = tl.program_id(1)
+  dim_start = tl.program_id(2) * BLOCK_D
+  offsets_d = dim_start + tl.arange(0, BLOCK_D)
+  mask_d = offsets_d < head_dim
 
-  if token_idx < L:
-    # 1. 获取该 token 对应的目标物理位置
-    target_pos = tl.load(indices_ptr + token_idx)
+  target_slot = tl.load(indices_ptr + token_idx)
 
-    # 2. 计算输入和输出的偏移量
-    # 输入偏移: token_idx * stride_k_l
-    # 输出偏移: target_pos * stride_cache_x
-    offsets_d = tl.arange(0, BLOCK_D)
-    mask_d = offsets_d < D
+  k_offset = (
+    token_idx * stride_k_token + head_idx * stride_k_head + offsets_d * stride_k_dim
+  )
+  v_offset = (
+    token_idx * stride_v_token + head_idx * stride_v_head + offsets_d * stride_v_dim
+  )
+  k_cache_offset = (
+    target_slot * stride_k_cache_slot
+    + head_idx * stride_k_cache_head
+    + offsets_d * stride_k_cache_dim
+  )
+  v_cache_offset = (
+    target_slot * stride_v_cache_slot
+    + head_idx * stride_v_cache_head
+    + offsets_d * stride_v_cache_dim
+  )
 
-    k_in_offsets = token_idx * stride_k_l + offsets_d * stride_k_d
-    v_in_offsets = token_idx * stride_k_l + offsets_d * stride_k_d  # 假设 v 和 k 步长一致
-
-    k_cache_offsets = target_pos * stride_cache_x + offsets_d * stride_cache_d
-    v_cache_offsets = target_pos * stride_cache_x + offsets_d * stride_cache_d
-
-    # 3. 加载并存储
-    k_val = tl.load(k_ptr + k_in_offsets, mask=mask_d)
-    v_val = tl.load(v_ptr + v_in_offsets, mask=mask_d)
-
-    tl.store(k_cache_ptr + k_cache_offsets, k_val, mask=mask_d)
-    tl.store(v_cache_ptr + v_cache_offsets, v_val, mask=mask_d)
+  k_values = tl.load(k_ptr + k_offset, mask=mask_d, other=0)
+  v_values = tl.load(v_ptr + v_offset, mask=mask_d, other=0)
+  tl.store(k_cache_ptr + k_cache_offset, k_values, mask=mask_d)
+  tl.store(v_cache_ptr + v_cache_offset, v_values, mask=mask_d)
 
 
 def store_kv_cache(k_cache, v_cache, indices, k, v):
-  # 简单的输入校验
-  L, D = k.shape
+  """Store K/V with shapes [tokens, heads, head_dim] at physical slot IDs.
 
-  # 确定 Triton 的 BLOCK_SIZE
-  # 假设 D (head_dim) 不会太大（如 64, 128, 256），可以直接用一个 block 处理完一整行
-  BLOCK_D = triton.next_power_of_2(D)
+  ``indices[token]`` chooses the cache row for each token. The selected slots
+  must be unique within this call, as they are for allocator-produced locations.
+  Tensor strides are passed to Triton, so inputs and cache views need not be
+  contiguous.
+  """
+  if k.ndim != 3 or v.ndim != 3:
+    raise ValueError(f"K and V must have shape [tokens, heads, head_dim], got {k.shape}, {v.shape}")
+  if k.shape != v.shape:
+    raise ValueError(f"K and V shapes must match, got {k.shape} and {v.shape}")
+  if k_cache.ndim != 3 or v_cache.ndim != 3:
+    raise ValueError("K and V cache tensors must have shape [slots, heads, head_dim]")
+  if k_cache.shape[1:] != k.shape[1:] or v_cache.shape[1:] != v.shape[1:]:
+    raise ValueError("Input and cache head dimensions must match")
+  if k_cache.shape[1:] != v_cache.shape[1:]:
+    raise ValueError("K and V cache head dimensions must match")
+  if indices.ndim != 1 or indices.numel() != k.shape[0]:
+    raise ValueError("indices must be one-dimensional with one slot ID per input token")
+  if k.shape[0] == 0:
+    return
 
-  grid = (L,)
+  tensors = (v, k_cache, v_cache, indices)
+  if any(t.device != k.device for t in tensors):
+    raise ValueError("K, V, caches, and indices must be on the same device")
+  if k.dtype != v.dtype or k.dtype != k_cache.dtype or v.dtype != v_cache.dtype:
+    raise ValueError("K, V, and their cache buffers must have matching dtypes")
 
+  if not k.is_cuda:
+    k_cache[indices.to(torch.long)] = k
+    v_cache[indices.to(torch.long)] = v
+    return
+
+  num_tokens, num_heads, head_dim = k.shape
+  block_d = min(triton.next_power_of_2(head_dim), 128)
+  grid = (num_tokens, num_heads, triton.cdiv(head_dim, block_d))
   store_kv_cache_kernel[grid](
     k,
     v,
     k_cache,
     v_cache,
     indices,
-    k.stride(0),
-    k.stride(1),
-    k_cache.stride(0),
-    k_cache.stride(1),
-    L,
-    D,
-    BLOCK_D=BLOCK_D,
+    *k.stride(),
+    *v.stride(),
+    *k_cache.stride(),
+    *v_cache.stride(),
+    num_tokens,
+    num_heads,
+    head_dim,
+    BLOCK_D=block_d,
   )

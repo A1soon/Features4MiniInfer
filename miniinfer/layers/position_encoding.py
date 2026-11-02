@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-from kernels.triton.rotary_embedding import apply_rotary_embedding
 from typing import Union, Optional, Tuple
 
 

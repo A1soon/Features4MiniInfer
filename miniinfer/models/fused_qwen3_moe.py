@@ -16,7 +16,9 @@
 per-expert 权重保持原样，可直接按专家 id 取用。
 """
 
-from typing import Dict, Optional
+from __future__ import annotations
+
+from typing import Dict, Optional, TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -29,7 +31,8 @@ from miniinfer.layers import (
 )
 from miniinfer.layers.fused_moe import FusedMoE, MoEParallelConfig
 from miniinfer.loader.weight import WeightLoaderMixin
-from miniinfer.scheduler.scheduler_batch import ForwardBatch
+if TYPE_CHECKING:
+  from miniinfer.scheduler.scheduler_batch import ForwardBatch
 
 from .base import BaseModelOutput
 from .fused_qwen3 import Qwen3Attention, Qwen3MLP
@@ -251,6 +254,7 @@ class Qwen3MoeForCausalLM(nn.Module, WeightLoaderMixin):
     config: Qwen3MoeConfig,
     device: torch.device,
     precision: torch.dtype = torch.float16,
+    parallel: Optional[MoEParallelConfig] = None,
   ):
     super().__init__()
     self.precision = precision
@@ -261,6 +265,7 @@ class Qwen3MoeForCausalLM(nn.Module, WeightLoaderMixin):
       config=config,
       device=device,
       precision=precision,
+      parallel=parallel,
     ).to(device)
 
     self.lm_head = LMHead(vocab_size=config.vocab_size, embedding_dim=config.hidden_size).to(device)
@@ -298,22 +303,21 @@ class Qwen3MoeForCausalLM(nn.Module, WeightLoaderMixin):
     # EXTEND 模式下只取每个序列最后一个 token 的 hidden state 做 lm_head，节省显存
     hidden_states_for_logits = hidden_states
     if forward_batch.forward_mode.is_extend():
-      extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None) or []
-      if extend_lens:
-        if hidden_states.dim() == 2:
+      last_token_indices = getattr(forward_batch, "last_token_indices", None)
+      if hidden_states.dim() == 2 and last_token_indices is not None:
+        hidden_states_for_logits = hidden_states.index_select(0, last_token_indices)
+      else:
+        extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None) or []
+        if extend_lens and hidden_states.dim() == 2:
           last_token_indices = []
           cumsum = 0
           for length in extend_lens:
             last_token_indices.append(cumsum + int(length) - 1)
             cumsum += int(length)
           hidden_states_for_logits = hidden_states[
-            torch.tensor(
-              last_token_indices,
-              device=hidden_states.device,
-              dtype=torch.int64,
-            )
+            torch.tensor(last_token_indices, device=hidden_states.device, dtype=torch.int64)
           ]
-        elif hidden_states.dim() == 3:
+        elif extend_lens and hidden_states.dim() == 3:
           bsz = hidden_states.size(0)
           idx = torch.tensor(
             [int(length) - 1 for length in extend_lens[:bsz]],

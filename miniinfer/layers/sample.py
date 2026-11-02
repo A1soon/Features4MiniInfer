@@ -5,7 +5,10 @@ import torch.nn as nn
 from miniinfer.utils import get_logger
 from dataclasses import dataclass
 from typing import List, Optional
-import flashinfer.sampling as sampling
+try:
+  import flashinfer.sampling as sampling
+except ImportError:
+  sampling = None
 
 logger = get_logger(__name__)
 
@@ -112,7 +115,7 @@ class Sampler(nn.Module):
       return torch.argmax(logits, dim=-1).to(torch.int64)
 
     # 2. 全非 greedy（temp>0）：flashinfer 融合路径。
-    if all_non_greedy:
+    if all_non_greedy and sampling is not None:
       probs = sampling.softmax(
         logits, temperature, enable_pdl=_is_sm90_supported(logits.device)
       )
@@ -121,11 +124,23 @@ class Sampler(nn.Module):
         return sampling.top_k_top_p_sampling_from_probs(probs, top_k, top_p).to(torch.int64)
       return sampling.sampling_from_probs(probs).to(torch.int64)
 
-    # 3. mixed：Gumbel-max 兼容路径（float32，正确处理 greedy one-hot 与 temp>0）。
+    # PyTorch path for mixed temperatures or environments without FlashInfer.
     temp = temperature.clamp_min(1e-5).unsqueeze(-1)
-    probs = torch.softmax(logits.float() / temp, dim=-1)
+    scores = logits.float() / temp
+    if enable_top_k_top_p:
+      scores, indices = scores.sort(dim=-1, descending=True)
+      ranks = torch.arange(V, device=logits.device).unsqueeze(0)
+      ks = torch.where(top_k > 0, top_k, torch.full_like(top_k, V)).clamp(max=V)
+      scores.masked_fill_(ranks >= ks.unsqueeze(-1), float("-inf"))
+      sorted_probs = scores.softmax(-1)
+      before = sorted_probs.cumsum(-1) - sorted_probs
+      scores.masked_fill_((before >= top_p.unsqueeze(-1)) & (ranks > 0), float("-inf"))
+      filtered = torch.full_like(scores, float("-inf"))
+      scores = filtered.scatter(-1, indices, scores)
+    probs = torch.softmax(scores, dim=-1)
     noise = torch.empty_like(probs).exponential_(1).clamp_min_(1e-10)
-    return (probs / noise).argmax(dim=-1).to(torch.int64)
+    sampled = (probs / noise).argmax(dim=-1).to(torch.int64)
+    return torch.where(temperature <= 0, logits.argmax(-1), sampled)
 
 
 def apply_custom_logits_processor(

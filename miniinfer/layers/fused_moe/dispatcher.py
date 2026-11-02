@@ -10,12 +10,11 @@
   all-reduce 求和。
 - TP 切每个专家的 intermediate 维度（``w13`` 行并行、``w2`` 列并行），
   ``w2`` 之后在 TP 组上 all-reduce。
-- TP 与 EP 正交：同时开启时，TP all-reduce（专家内）与 EP all-reduce
-  （专家间）合成对合并组的一次 all-reduce。
+- TP 与 EP 正交：当前 combine 依次执行 EP 和 TP 两次 all-reduce。
 
-本模块**不**自行创建 process group；调用方传入 torch.distributed 的
-group（或 ``None`` 表示 size=1）。size=1 时所有 all-reduce / all-gather
-都是 no-op，单 GPU 跑时不会触发任何 dist 调用。
+可通过 create_moe_parallel_config 建立正交组，也可显式传入已有 group。
+size=1 时 collective 是 no-op；size>1 且 group=None 时使用默认 WORLD，
+运行前检查 WORLD 是否确实匹配该并行维度。
 """
 from __future__ import annotations
 
@@ -39,6 +38,62 @@ class MoEParallelConfig:
     dp_size: int = 1
     dp_rank: int = 0
 
+    def __post_init__(self):
+        for axis in ("tp", "ep", "dp"):
+            size, rank = getattr(self, f"{axis}_size"), getattr(self, f"{axis}_rank")
+            if not isinstance(size, int) or isinstance(size, bool) or size < 1:
+                raise ValueError(f"{axis}_size must be a positive integer")
+            if not isinstance(rank, int) or isinstance(rank, bool) or not 0 <= rank < size:
+                raise ValueError(f"{axis}_rank must be in [0, {size})")
+
+    def expert_range(self, num_experts: int) -> tuple[int, int]:
+        if num_experts <= 0 or num_experts % self.ep_size:
+            raise ValueError("num_experts must be positive and divisible by ep_size")
+        count = num_experts // self.ep_size
+        return self.ep_rank * count, (self.ep_rank + 1) * count
+
+    def validate_group(self, axis: str):
+        size = getattr(self, f"{axis}_size")
+        if size == 1:
+            return
+        if not dist.is_initialized():
+            raise RuntimeError("Initialize torch.distributed before a parallel MoE forward")
+        group = getattr(self, f"{axis}_group")
+        if (dist.get_world_size(group) != size
+                or dist.get_rank(group) != getattr(self, f"{axis}_rank")):
+            raise ValueError(f"{axis} process group does not match its configured size/rank")
+
+
+def create_moe_parallel_config(tp_size: int = 1, ep_size: int = 1) -> MoEParallelConfig:
+    """Create orthogonal groups on all ranks of an already initialized WORLD.
+
+    Global rank = ep_rank * tp_size + tp_rank. Every rank must call this
+    function in the same order, including ranks outside each subgroup.
+    """
+    MoEParallelConfig(tp_size=tp_size, ep_size=ep_size)
+    if not dist.is_initialized():
+        raise RuntimeError("Initialize torch.distributed before creating MoE groups")
+    if dist.get_world_size() != tp_size * ep_size:
+        raise ValueError("WORLD size must equal tp_size * ep_size")
+    rank = dist.get_rank()
+    config = MoEParallelConfig(
+        tp_size=tp_size, tp_rank=rank % tp_size,
+        ep_size=ep_size, ep_rank=rank // tp_size,
+    )
+    for ep_rank in range(ep_size):
+        ranks = list(range(ep_rank * tp_size, (ep_rank + 1) * tp_size))
+        if tp_size > 1:
+            group = dist.new_group(ranks)
+            if rank in ranks:
+                config.tp_group = group
+    for tp_rank in range(tp_size):
+        ranks = list(range(tp_rank, tp_size * ep_size, tp_size))
+        if ep_size > 1:
+            group = dist.new_group(ranks)
+            if rank in ranks:
+                config.ep_group = group
+    return config
+
 
 class MoEDispatcher:
     """基于 mask 的 dispatcher（无 all-to-all）。
@@ -48,14 +103,11 @@ class MoEDispatcher:
     """
 
     def __init__(self, parallel: MoEParallelConfig, num_experts: int):
-        assert num_experts % parallel.ep_size == 0, (
-            f"num_experts={num_experts} must be divisible by ep_size={parallel.ep_size}"
-        )
+        start, end = parallel.expert_range(num_experts)
         self.parallel = parallel
         self.num_experts = num_experts
         self.experts_per_rank = num_experts // parallel.ep_size
-        self.local_expert_start = parallel.ep_rank * self.experts_per_rank
-        self.local_expert_end = (parallel.ep_rank + 1) * self.experts_per_rank
+        self.local_expert_start, self.local_expert_end = start, end
 
     def combine(self, partial: torch.Tensor) -> torch.Tensor:
         """在 EP 与 TP 组上对 partial 专家输出求和。
@@ -70,8 +122,10 @@ class MoEDispatcher:
         导致 MoE 输出错乱。size==1 时下面两个分支都不进，自然 no-op。
         """
         if self.parallel.ep_size > 1:
+            self.parallel.validate_group("ep")
             dist.all_reduce(partial, op=dist.ReduceOp.SUM, group=self.parallel.ep_group)
         if self.parallel.tp_size > 1:
+            self.parallel.validate_group("tp")
             dist.all_reduce(partial, op=dist.ReduceOp.SUM, group=self.parallel.tp_group)
         return partial
 
@@ -86,8 +140,9 @@ def prepare_mlp(
     None；否则它是把本 rank shard 映射回去的索引，供调用方在 MoE 后
     re-shard。
     """
-    if parallel.dp_size <= 1 or parallel.dp_group is None:
+    if parallel.dp_size <= 1:
         return hidden, None
+    parallel.validate_group("dp")
 
     T_local, H = hidden.shape
     T_full = T_local * parallel.dp_size

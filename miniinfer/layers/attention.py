@@ -228,9 +228,6 @@ def ref_scaled_dot_product_attention(
   return attn_weight @ value
 
 
-from flash_attn import flash_attn_qkvpacked_func, flash_attn_func
-
-
 def flash_attn_wrapper(
   query: torch.Tensor,
   key: torch.Tensor,
@@ -250,6 +247,8 @@ def flash_attn_wrapper(
   Returns:
       torch.Tensor: Output tensor of shape (batch_size, num_heads, seq_len_q, depth_v).
   """
+  from flash_attn import flash_attn_func
+
   is_causal = False
   if isinstance(mask, str) and mask == "causal":
     is_causal = True

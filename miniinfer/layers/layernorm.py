@@ -2,7 +2,6 @@ import torch
 from torch import nn
 from typing import Dict, Optional
 
-from kernels.triton.rms_norm import add_rms_norm_forward
 from miniinfer.loader.weight import WeightLoaderMixin
 
 
@@ -37,6 +36,11 @@ class RMSNorm(nn.Module, WeightLoaderMixin):
     residual: Optional[torch.Tensor] = None,
   ) -> torch.Tensor:
     if residual is not None:
+      if x.device.type != "cuda":
+        residual_out = x + residual
+        return self.rms_forward(residual_out), residual_out
+      from kernels.triton.rms_norm import add_rms_norm_forward
+
       out, residual_out = add_rms_norm_forward(x, residual, self.weight, self.eps)
       return out, residual_out
     return self.rms_forward(x)

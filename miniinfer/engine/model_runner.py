@@ -18,15 +18,10 @@ from miniinfer.config.model.qwen3 import Qwen3Config
 from miniinfer.config.model.qwen3_moe import Qwen3MoeConfig
 from miniinfer.loader.weight import load_hf_weight
 from miniinfer.models.base import BaseModelOutput
-from miniinfer.models.fused_qwen2 import Qwen2ForCausalLM
 from miniinfer.models.fused_qwen3 import Qwen3ForCausalLM
 from miniinfer.models.fused_qwen3_moe import Qwen3MoeForCausalLM
 from miniinfer.scheduler.scheduler_batch import ForwardBatch
 from miniinfer.layers.sample import Sampler, SamplingBatchInfo
-from miniinfer.layers.attention_backend import (
-  FlashAttention2Backend,
-  FlashInferBackend,
-)
 from miniinfer.engine.cuda_graph_runner import CudaGraphRunner
 from miniinfer.utils import get_logger
 from miniinfer.utils.profiler_utils import profile_methods
@@ -49,18 +44,26 @@ class ModelRunner:
     rank: int = 0,
     events: list = None,
     attn_backend: str = "flash_attn",
+    device: str | torch.device | None = None,
+    moe_parallel=None,
   ):
     self.config = config
     self.kv_cache_mgr = kv_cache_mgr
     self.rank = rank
     self.events = events or []
-    self.device = "cuda" if torch.cuda.is_available() else "cpu"
+    self.device = (
+      str(device) if device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
+    )
     self.attn_backend = None
     self._attn_backend_type = attn_backend
 
     model_type = getattr(config.hf_config, "model_type", "").lower()
     architectures = getattr(config.hf_config, "architectures", []) or []
-    if model_type == "qwen2" or ("Qwen2" in config.model and model_type not in ("qwen3", "qwen3_moe")):
+    if model_type == "qwen2" or (
+      "Qwen2" in config.model and model_type not in ("qwen3", "qwen3_moe")
+    ):
+      from miniinfer.models.fused_qwen2 import Qwen2ForCausalLM
+
       self.model_config: PretrainedConfig = Qwen2Config.from_pretrained(config.model)
       self.model = Qwen2ForCausalLM(self.model_config, device=self.device)
       logger.info("Initialized Qwen2Model")
@@ -70,7 +73,12 @@ class ModelRunner:
       logger.info("Initialized Qwen3Model")
     elif model_type == "qwen3_moe" or "Qwen3MoeForCausalLM" in architectures:
       self.model_config: PretrainedConfig = Qwen3MoeConfig.from_pretrained(config.model)
-      self.model = Qwen3MoeForCausalLM(self.model_config, device=self.device)
+      self.model = Qwen3MoeForCausalLM(
+        self.model_config,
+        device=self.device,
+        precision=config.dtype,
+        parallel=moe_parallel,
+      )
       logger.info("Initialized Qwen3MoeModel")
     else:
       self.model = None
@@ -80,7 +88,7 @@ class ModelRunner:
     # CUDA Graph support
     self.cuda_graph_runner: CudaGraphRunner = None
     self.piecewise_graph_runner = None  # prefill piecewise cuda graph（MoE-extensible）
-    self.use_cuda_graph: bool = not config.enforce_eager
+    self.use_cuda_graph: bool = not config.enforce_eager or config.enable_ep_cuda_graph
 
     # 如果提供了 kv_cache_mgr，立即初始化 attn_backend
     if kv_cache_mgr is not None:
@@ -90,6 +98,18 @@ class ModelRunner:
     """初始化加载模型"""
     if self.model is None:
       raise RuntimeError("Model is not initialized")
+    if isinstance(self.model, Qwen3MoeForCausalLM):
+      from miniinfer.loader.moe import load_qwen3_moe_weights
+      from huggingface_hub import snapshot_download
+      import os
+
+      path = self.config.model
+      if not os.path.isdir(path):
+        path = snapshot_download(path, allow_patterns=["*.safetensors", "*.safetensors.index.json"])
+      self.weight_load_report = load_qwen3_moe_weights(self.model, path)
+      self.model.eval()
+      logger.info(f"MoE weights loaded on {self.device}: {self.weight_load_report}")
+      return
     self.state_dicts = load_hf_weight(self.config.model, self.device)
     self.model.load_weights(self.state_dicts)
     self.model.eval()
@@ -99,7 +119,8 @@ class ModelRunner:
     """初始化 attention backend（需要先提供 kv_cache_mgr）
 
     接受多种别名：``flash_attn``/``flash_attention_2``/``flash_attention2``/``fa2``
-    → FlashAttention2；``flashinfer``/``flash_infer`` → FlashInfer。
+    → FlashAttention2；``flashinfer``/``flash_infer`` → FlashInfer；
+    ``flash_attn_v100`` → FP16 SM70 paged attention。
     """
     if self.kv_cache_mgr is None:
       raise RuntimeError("Cannot initialize attn_backend without kv_cache_mgr")
@@ -107,9 +128,17 @@ class ModelRunner:
     attn_backend = (attn_backend or self._attn_backend_type or "").lower()
     fa2_aliases = {"flash_attn", "flash_attention_2", "flash_attention2", "fa2", "flash-attn"}
     fi_aliases = {"flashinfer", "flash_infer", "flash-infer"}
-    if attn_backend in fi_aliases:
+    if attn_backend == "flash_attn_v100":
+      from miniinfer.layers.attention_backend import FlashAttentionV100Backend
+
+      self.attn_backend = FlashAttentionV100Backend(self.kv_cache_mgr)
+    elif attn_backend in fi_aliases:
+      from miniinfer.layers.attention_backend import FlashInferBackend
+
       self.attn_backend = FlashInferBackend(self.kv_cache_mgr)
     elif attn_backend in fa2_aliases:
+      from miniinfer.layers.attention_backend import FlashAttention2Backend
+
       self.attn_backend = FlashAttention2Backend(self.kv_cache_mgr)
     else:
       raise ValueError(f"Unsupported attention backend: {attn_backend}")
@@ -235,31 +264,27 @@ class ModelRunner:
     self.cuda_graph_runner.warmup()
     logger.info("CUDA Graph warmup complete")
 
-    # Piecewise cuda graph for prefill（MoE-extensible）。v1：capture 仍有 capture-
-    # unsafe op + last-token 索引待修，默认关闭（回落 eager prefill，无回归）。
-    # 设 MINIINFER_PREFILL_CG=1 开启尝试（失败自动回落 eager）。
+    # Optional static-bucket prefill/mixed graph. Unsupported shapes return None
+    # and continue through the existing eager path.
     import os as _os
+
     if (
       self.use_cuda_graph
       and _os.getenv("MINIINFER_PREFILL_CG", "0") == "1"
+      and self.config.attention_backend == "flash_attn_v100"
       and hasattr(self.attn_backend, "init_extend_cuda_graph_metadata")
     ):
       try:
-        from miniinfer.engine.piecewise_cuda_graph import (
-          PiecewiseCudaGraphRunner,
-          Segment,
-        )
+        from miniinfer.engine.piecewise_cuda_graph import PiecewiseCudaGraphRunner
+
         self.piecewise_graph_runner = PiecewiseCudaGraphRunner(self)
-        # v1 dense：单 captured segment。MoE 扩展点：后续注册 eager segment
-        # （router/grouped-GEMM），框架按顺序串联。
-        self.piecewise_graph_runner.register_segment(
-          Segment(name="dense_forward", eager=False, run=lambda ctx: None)
-        )
         self.piecewise_graph_runner.capture()
         if not self.piecewise_graph_runner.is_available():
           logger.info("Piecewise cuda graph: no bucket captured; prefill uses eager")
           self.piecewise_graph_runner = None
       except Exception as e:
+        if self.config.expert_parallel_size > 1:
+          raise
         logger.warning(f"Piecewise cuda graph init failed ({e!r}); prefill uses eager")
         self.piecewise_graph_runner = None
     else:

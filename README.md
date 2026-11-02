@@ -35,7 +35,7 @@ MiniInfer 是一个学习性质的大语言模型推理引擎，从零实现了�
 | 256 seq × 1024 out（decode-heavy） | KV 不足 | **17,369 tok/s** | 16,333 tok/s |
 | 256 seq × 256 out（短序列） | — | **10,552 tok/s** | 10,050 tok/s |
 
-> **decode-heavy 场景（长输出）MiniInfer 优化后反超 vLLM**；均衡负载的剩余差距在 prefill 阶段（eager，无 cuda graph），piecewise cuda graph 框架已就位待闭合。
+> **decode-heavy 场景（长输出）MiniInfer 优化后反超 vLLM**；均衡负载的剩余差距在 prefill 阶段。V100 静态 bucket full-forward CUDA Graph 已完成真实 EP4 capture/replay 与 mixed/prefix smoke，但 unpadded eager 的 strict logits parity 和性能仍待闭合；功能默认关闭，记录见 `docs/Piecewise_CudaGraph_Prefill设计.md`。
 
 ### 优化历程
 
@@ -76,7 +76,7 @@ MiniInfer 是一个学习性质的大语言模型推理引擎，从零实现了�
 | **OverlapExecutor** | `engine/overlap_executor.py` | SGLang 风格双 batch overlap（schedule_stream / forward_stream / copy_stream） |
 | **CudaGraphRunner** | `engine/cuda_graph_runner.py` | Decode CUDA Graph 捕获/重放（power-of-2 batch size） |
 | **MultiProcessEngine** | `engine/multi_process_engine.py` | 三进程 ZMQ 流水线（Tokenizer / EngineCore / Detokenizer） |
-| **PiecewiseCudaGraph** | `engine/piecewise_cuda_graph.py` | Prefill piecewise cuda graph 框架（MoE-extensible，v1 默认关闭） |
+| **PiecewiseCudaGraph** | `engine/piecewise_cuda_graph.py` | V100 静态 bucket prefill/mixed full-forward graph（默认关闭；strict unpadded parity 和性能待验证） |
 
 ### Attention Backend
 
@@ -84,6 +84,10 @@ MiniInfer 是一个学习性质的大语言模型推理引擎，从零实现了�
 |---|---|
 | **FlashAttention2** (`flash_attn_with_kvcache`) | paged decode，split-KV，page_size=256 |
 | **FlashInfer** (`BatchDecodeWithPagedKVCacheWrapper`) | vLLM-grade paged decode，`use_cuda_graph=True`，无 page_size 约束 |
+
+V100 可显式选择 `attention_backend="flash_attn_v100"`，使用第三方 SM70 FP16
+paged attention 扩展，支持 prefill、decode、prefix cache 和 mixed batch。
+接入与复现命令见 [V100 backend 验证说明](docs/v100_backend.md)。
 
 ### 支持模型
 
@@ -126,6 +130,58 @@ with LLMEngine(
 ) as engine:
     outputs = engine.generate(prompts=["Hello"], sampling_params=SamplingParams(max_tokens=64))
 ```
+
+### L2 Prefill Budget 实验
+
+`fixed` 保持原有的 `max_extend_len/chunked_prefill_size` 行为；`aggregate`
+增加每轮共享的模型计算预算。启用 `aggregate` 时，必须同时启用 chunked
+prefill，并设置 `max_num_batched_tokens`：
+
+```python
+with LLMEngine(
+    model="/path/to/Qwen3-0.6B",
+    enable_chunked_prefill=True,
+    prefill_budget_policy="aggregate",
+    max_num_batched_tokens=2048,
+    chunked_prefill_size=4096,
+    enforce_eager=True,
+    enable_overlap=False,
+) as engine:
+    outputs = engine.generate(
+        prompts=["A long prompt ..."],
+        sampling_params=SamplingParams(max_tokens=64, temperature=0.0),
+    )
+```
+
+其中 `P_t` 是本轮实际 prefill/extend token 数，`D_t` 是本轮 decode token
+数，调度器保证 `P_t + D_t <= max_num_batched_tokens`；KV page 的容量检查
+仍然独立进行。预算算术可以在没有 CUDA/Triton 的机器上用以下测试验证：
+
+```bash
+pytest -q tests/unittests/test_prefill_budget_policy.py
+```
+
+### Retract 状态保留实验
+
+第一版只支持 non-overlap 路径。打开后，KV 紧张触发 retract 时会保留请求的
+`output_ids`，并用 Radix prefix cache 尽量恢复已经存在的 KV；最新采样但尚未
+再次经过 forward 的 token 不会被伪装成已有 KV。必须同时关闭 overlap：
+
+```python
+with LLMEngine(
+    model="/path/to/Qwen3-0.6B",
+    enable_retract_state_preservation=True,
+    enable_overlap=False,
+    enforce_eager=True,
+) as engine:
+    outputs = engine.generate(
+        prompts=["A long prompt ..."],
+        sampling_params=SamplingParams(max_tokens=64, temperature=0.0),
+    )
+```
+
+默认值仍为 `False`，因此不改变原有 baseline；开启后应先做 forced-retract
+correctness，再测恢复延迟和重算 token 数。
 
 ### Benchmark
 

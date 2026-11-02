@@ -2,7 +2,6 @@ from __future__ import annotations
 from .base_backend import AttentionBackend
 import torch
 from dataclasses import dataclass
-from flash_attn import flash_attn_with_kvcache, flash_attn_varlen_func
 from typing import Optional, TYPE_CHECKING
 from miniinfer.utils import get_logger
 
@@ -39,6 +38,9 @@ class FlashAttention3Metadata:
 class FlashAttention3Backend(AttentionBackend):
   def __init__(self, kv_cache_mgr: KVCacheManager):
     super().__init__()
+    from flash_attn import flash_attn_with_kvcache
+
+    self._with_kvcache = flash_attn_with_kvcache
     self.forward_metadata: FlashAttention3Metadata = None
     self.kv_cache_mgr: KVCacheManager = kv_cache_mgr
     self.page_size: int = kv_cache_mgr.page_size
@@ -147,7 +149,7 @@ class FlashAttention3Backend(AttentionBackend):
     key_cache = key_cache.view(-1, self.page_size, layer.tp_k_head_num, layer.head_dim)
     value_cache = value_cache.view(-1, self.page_size, layer.tp_v_head_num, layer.v_head_dim)
 
-    o = flash_attn_with_kvcache(
+    o = self._with_kvcache(
       q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
       k_cache=key_cache,
       v_cache=value_cache,
@@ -209,7 +211,7 @@ class FlashAttention3Backend(AttentionBackend):
     q_reshaped = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
 
     # Default: single-token self-attention
-    o = flash_attn_with_kvcache(
+    o = self._with_kvcache(
       q=q_reshaped,
       k_cache=key_cache,
       v_cache=value_cache,
@@ -251,6 +253,10 @@ class FlashAttention2Metadata:
 class FlashAttention2Backend(AttentionBackend):
   def __init__(self, kv_cache_mgr: KVCacheManager):
     super().__init__()
+    from flash_attn import flash_attn_with_kvcache, flash_attn_varlen_func
+
+    self._with_kvcache = flash_attn_with_kvcache
+    self._varlen = flash_attn_varlen_func
     self.forward_metadata: FlashAttention2Metadata = None
     self.kv_cache_mgr: KVCacheManager = kv_cache_mgr
     self.page_size: int = kv_cache_mgr.page_size
@@ -438,7 +444,7 @@ class FlashAttention2Backend(AttentionBackend):
       k_reshaped = k.contiguous().view(-1, layer.tp_k_head_num, layer.head_dim)
       v_reshaped = v.contiguous().view(-1, layer.tp_v_head_num, layer.v_head_dim)
 
-    o = flash_attn_varlen_func(
+    o = self._varlen(
       q=q_reshaped,
       k=k_reshaped,
       v=v_reshaped,
@@ -519,7 +525,7 @@ class FlashAttention2Backend(AttentionBackend):
 
     # FA2 decode: use flash_attn_with_kvcache
     # Include cu_seqlens_q and max_seqlen_q for proper batch handling
-    o = flash_attn_with_kvcache(
+    o = self._with_kvcache(
       q=q_reshaped,
       k_cache=key_cache,
       v_cache=value_cache,

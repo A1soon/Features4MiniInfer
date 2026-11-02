@@ -7,14 +7,16 @@ Qwen3 模型实现（融合 QKV/Gate-Up 投影）
 3. QK-Norm: 在 RoPE 之前对 Q/K 进行 per-head RMSNorm
 """
 
-from typing import Dict, Optional
+from __future__ import annotations
 
-from miniinfer.scheduler.scheduler_batch import ForwardBatch
+from typing import Dict, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+  from miniinfer.scheduler.scheduler_batch import ForwardBatch
 
 from .base import BaseModelOutput
 import torch
 import torch.nn as nn
-from kernels.triton.silu_mul import SiluAndMul
 from miniinfer.layers import (
   AttentionImpl,
   LMHead,
@@ -121,7 +123,16 @@ class Qwen3MLP(nn.Module, WeightLoaderMixin):
     self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
     if hidden_act != "silu":
       raise ValueError(f"Unsupported activation: {hidden_act}. Only silu is supported for now.")
-    self.act_fn = SiluAndMul
+    self.act_fn = self._silu_mul
+
+  @staticmethod
+  def _silu_mul(x):
+    if x.is_cuda:
+      from kernels.triton.silu_mul import SiluAndMul
+
+      return SiluAndMul(x)
+    gate, up = x.chunk(2, dim=-1)
+    return torch.nn.functional.silu(gate) * up
 
   def load_weights(self, state_dict: Dict[str, torch.Tensor], prefix: str, device, dtype):
     gate_up_w_key = f"{prefix}.gate_up_proj.weight"
@@ -317,22 +328,21 @@ class Qwen3ForCausalLM(nn.Module, WeightLoaderMixin):
     # EXTEND 模式下只取每个序列最后一个 token 的 hidden state 做 lm_head，节省显存
     hidden_states_for_logits = hidden_states
     if forward_batch.forward_mode.is_extend():
-      extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None) or []
-      if extend_lens:
-        if hidden_states.dim() == 2:
+      last_token_indices = getattr(forward_batch, "last_token_indices", None)
+      if hidden_states.dim() == 2 and last_token_indices is not None:
+        hidden_states_for_logits = hidden_states.index_select(0, last_token_indices)
+      else:
+        extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None) or []
+        if extend_lens and hidden_states.dim() == 2:
           last_token_indices = []
           cumsum = 0
           for length in extend_lens:
             last_token_indices.append(cumsum + int(length) - 1)
             cumsum += int(length)
           hidden_states_for_logits = hidden_states[
-            torch.tensor(
-              last_token_indices,
-              device=hidden_states.device,
-              dtype=torch.int64,
-            )
+            torch.tensor(last_token_indices, device=hidden_states.device, dtype=torch.int64)
           ]
-        elif hidden_states.dim() == 3:
+        elif extend_lens and hidden_states.dim() == 3:
           bsz = hidden_states.size(0)
           idx = torch.tensor(
             [int(length) - 1 for length in extend_lens[:bsz]],

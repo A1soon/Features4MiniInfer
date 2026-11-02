@@ -15,10 +15,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 from torch import nn
-
-from miniinfer.layers.fused_moe.fused_moe_kernel import fused_experts_triton
-
-
+# fusedExperts是指将MoE的MLP实现Fused版本
 class FusedExperts(nn.Module):
     def __init__(
         self,
@@ -48,10 +45,12 @@ class FusedExperts(nn.Module):
         self.intermediate_size_local = intermediate_size // tp_size
         kw = {"dtype": dtype, "device": device}
         # 仅 BF16/FP16/FP32，无量化：直接用浮点堆叠权重。
+        # w13_weight是指up gate的权重矩阵，这里为了减少launch把它们fused在一个矩阵里面了
         self.w13_weight = nn.Parameter(
             torch.empty(self.num_local_experts, 2 * self.intermediate_size_local, hidden_size, **kw),
             requires_grad=False,
         )
+        # w2_weight指的是down的权重矩阵
         self.w2_weight = nn.Parameter(
             torch.empty(self.num_local_experts, hidden_size, self.intermediate_size_local, **kw),
             requires_grad=False,
@@ -60,8 +59,10 @@ class FusedExperts(nn.Module):
         # expert_map 是 (num_experts, ep_rank, ep_size) 的纯函数，构造后不变。
         # 注册为 buffer 以便只建一次（非每步 forward 分配）并随 .to()/.cuda()
         # 一起搬运。-1 标远程专家；本地专家持有其在 w13/w2 中的本地行索引。
+        # full功能是创建一个维度矩阵，然后矩阵里面填满同一个值，如这里创建一个一维的长度为num_experts且内容全为-1的矩阵
         expert_map = torch.full((self.num_experts,), -1, dtype=torch.int32, device=device)
         local_ids = torch.arange(self.num_local_experts, dtype=torch.int32, device=device)
+        # 只填写本地rank拥有的experts的local_ids
         expert_map[self.local_expert_start : self.local_expert_end] = local_ids
         self.register_buffer("expert_map", expert_map, persistent=False)
 
@@ -81,12 +82,27 @@ class FusedExperts(nn.Module):
         #
         # 只增不减；warmup_model() 按最大 TK 一次分配，故永不重分配、基址在
         # CUDA-graph replay 间稳定。
+
+        # c2：用来存激活函数的输出（给 w2 做输入的）。
+        # c3：用来存 w2 算出来的结果。
+        # c1：用来存 w13 算出来的中间结果。
+
+        #c1 和 c2 的内存区域是重叠（重叠）的。
+        # 因为在 GPU 里，w13 算出结果 c1 后，紧接着经过激活函数，结果就直接覆盖写进 c2 了（此时 c1 的数据没用了，叫“已死”）。
+        # 而 c2（输入）和 c3（输出）是绝对不能重叠的，因为 w2 的矩阵乘法是一边读 c2 一边写 c3。
         self._workspace: torch.Tensor | None = None
 
+
     def _ensure_workspace(self, tk: int, device, dtype) -> torch.Tensor:
-        I = self.intermediate_size_local
+        # 这里tk是token数目与其要路由到的expert数目的乘积
+        # intermediate是expert的中间维度
+        intermediate = self.intermediate_size_local
         H = self.hidden_size
-        need = tk * max(2 * I, I + H)
+        # need是workspace需要的空间，这里为什么是max(2*intermediate,intermediate*h)呢
+        # 在c1中计算 hidden * w_13即计算hidden和w_13(up和gate)的矩阵乘，需要tk ✖️ 2*intermediate
+        # 而在c2或者c3中计算的中间大矩阵split之后就需要tk * intermediate（c2） + tk * H (c3)的空间
+        # 且c2可在c1的空间基础上完成，c3需要新的空间；所以二者取max
+        need = tk * max(2 * intermediate, intermediate + H)
         ws = self._workspace
         if (
             ws is None
@@ -98,6 +114,7 @@ class FusedExperts(nn.Module):
             self._workspace = ws
         return ws
 
+    # 在GPU上的fused forward，准备好workspace并用triton进行MoE计算
     def forward(
         self,
         hidden_states: torch.Tensor,        # (T, H)，完整 token 集
@@ -110,13 +127,15 @@ class FusedExperts(nn.Module):
             emap = emap.to(hidden_states.device)
             self.expert_map = emap
         if hidden_states.is_cuda:
-            I = self.intermediate_size_local
+            from .fused_moe_kernel import fused_experts_triton
+
+            intermediate = self.intermediate_size_local
             H = self.hidden_size
             tk = hidden_states.size(0) * topk_ids.size(1)
             ws = self._ensure_workspace(tk, hidden_states.device, hidden_states.dtype)
-            c1 = ws[: tk * 2 * I].view(tk, 2 * I)
-            c2 = ws[: tk * I].view(tk, I)
-            c3 = ws[tk * I : tk * I + tk * H].view(tk, H)
+            c1 = ws[: tk * 2 * intermediate].view(tk, 2 * intermediate)
+            c2 = ws[: tk * intermediate].view(tk, intermediate)
+            c3 = ws[tk * intermediate : tk * intermediate + tk * H].view(tk, H)
             return fused_experts_triton(
                 hidden_states,
                 self.w13_weight,
@@ -130,7 +149,7 @@ class FusedExperts(nn.Module):
             )
         # CPU eager fallback（gloo 多 rank parity 测试用）。
         return self._eager_forward(hidden_states, topk_ids, topk_weights)
-
+    # 在cpu上的即使forward
     def _eager_forward(self, hidden_states, topk_ids, topk_weights):
         T, H = hidden_states.shape
         out = torch.zeros_like(hidden_states)
